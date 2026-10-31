@@ -1868,6 +1868,21 @@ class BluetoothTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.connects()), 1)
         self.assertEqual(self.events.toasts, ["AirPods Pro 연결됨"])
 
+    async def test_a_press_waits_out_bluez_reconnecting_on_its_own(self):
+        self.bluez.set(PODS, paired=True, trusted=True)
+        self.bluez.errors["connect"] = ["org.bluez.Error.InProgress -- br-connection-busy"] * 8
+        await self.bt.activate(PODS)
+        self.assertEqual(len(self.connects()), 9, "more than a failure would be tried")
+        self.assertEqual(self.events.toasts, ["AirPods Pro 연결됨"])
+
+    async def test_bluez_that_stays_busy_is_a_failure_said_once(self):
+        self.bt.BUSY_WAIT = 0.12
+        self.bluez.set(PODS, paired=True, trusted=True)
+        self.bluez.errors["connect"] = ["org.bluez.Error.InProgress -- br-connection-busy"] * 100
+        await self.bt.activate(PODS)
+        self.assertLess(len(self.connects()), 10)
+        self.assertEqual(self.events.toasts, ["AirPods Pro에 연결할 수 없음"])
+
     async def test_bluetooth_left_on_comes_back_after_a_boot(self):
         await self.bt.set_enabled(True)
         self.assertTrue(Settings(os.path.dirname(self.settings.path))["bluetooth"])
@@ -1931,6 +1946,18 @@ class BluetoothTest(unittest.IsolatedAsyncioTestCase):
                                                 ("trust", PAD), ("connect", PAD, None)])
         await asyncio.sleep(0.01)
         self.assertEqual(self.bluez.calls[5:], [("discover", True)], "it looks again once that is done")
+
+    async def test_an_inquiry_gives_way_to_headphones_that_reach_out_by_themselves(self):
+        self.events.page_changed = lambda *paths: self.bt.begin_discovery()  # the open page, redrawn
+        self.bt.begin_discovery()
+        await asyncio.sleep(0.01)
+        self.bluez.set(PODS, connected=True, paired=True)
+        await asyncio.sleep(0.01)
+        self.assertEqual(self.bluez.calls, [("discover", True), ("discover", False)],
+                         "ended at the link, before the stream, and not begun again by the redrawn page")
+        self.bluez.set(PODS, connected=False)
+        await asyncio.sleep(0.01)
+        self.assertEqual(self.bluez.calls[2:], [("discover", True)], "it looks again once they have hung up")
 
 
 class WifiSwitchTest(unittest.IsolatedAsyncioTestCase):

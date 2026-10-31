@@ -11,6 +11,7 @@ A2DP_SINK = "0000110b-0000-1000-8000-00805f9b34fb"
 PLAYER = "/isopod/player"
 MPRIS = "org.mpris.MediaPlayer2.Player"
 REMOTE = {"Play": "play", "Pause": "pause", "Stop": "pause", "Next": "next", "Previous": "prev"}
+BUSY = ("InProgress", "busy")
 
 
 @dataclasses.dataclass
@@ -345,6 +346,7 @@ class Bluetooth:
     ATTEMPTS = 3
     RETRY_DELAY = 1.0
     STREAM_WAIT = 4.0
+    BUSY_WAIT = 30.0
 
     def __init__(self, backend, state, settings, t, events, system):
         self.backend = backend
@@ -402,8 +404,8 @@ class Bluetooth:
                 self._announce(device)
             if device.is_audio:
                 (self.events.audio_device_found if device.ready else self.events.audio_device_lost)(device)
-                if device.ready and self.discovering:
-                    self.end_discovery()
+        if device and device.is_audio and device.connected and self.discovering:
+            self.end_discovery()
         self._publish()
         self.events.page_changed("/settings/bluetooth", "/control", "/settings")
 
@@ -443,7 +445,8 @@ class Bluetooth:
         return sorted(devs, key=lambda d: -(d.rssi if d.rssi is not None else -200))
 
     def _listening(self):
-        return any(d.ready and d.is_audio for d in self.backend.devices.values())
+        """From the link up: AirPods reaching out by themselves hang up on a radio at an inquiry."""
+        return any(d.connected and d.is_audio for d in self.backend.devices.values())
 
     def find(self, path):
         return self.backend.devices.get(path)
@@ -536,7 +539,8 @@ class Bluetooth:
         if dev.is_audio:
             if not dev.trusted:
                 await self.backend.trust(path)
-            await self._retry(lambda: self._connect_audio(path))
+            patience = asyncio.get_running_loop().time() + self.BUSY_WAIT
+            await self._retry(lambda: self._connect_audio(path, patience))
         else:
             if not dev.paired:
                 await self.backend.pair(path)
@@ -545,18 +549,23 @@ class Bluetooth:
                 await self.backend.trust(path)
             await self._retry(lambda: self.backend.connect(path))
 
-    async def _connect_audio(self, path):
+    async def _connect_audio(self, path, patience):
         """Headphones are reached by their A2DP service: that connection is always classic
         Bluetooth, whatever BlueZ learnt of the device over LE, and it pairs new ones on the way."""
-        try:
-            await self.backend.connect(path, A2DP_SINK)
-        except Exception as e:
-            # Headphones that connected by themselves leave BlueZ nothing to connect.
-            if not any(word in str(e) for word in ("unavailable", "NotAvailable", "InProgress", "busy")):
-                raise
-            if not await self._stream(path, self.STREAM_WAIT):
-                raise
-            return
+        while True:
+            try:
+                await self.backend.connect(path, A2DP_SINK)
+                break
+            except Exception as e:
+                # Headphones that connected by themselves leave BlueZ nothing to connect.
+                if not any(word in str(e) for word in ("unavailable", "NotAvailable", *BUSY)):
+                    raise
+                if await self._stream(path, self.STREAM_WAIT):
+                    return
+                # BlueZ turns a press away for as long as it reconnects them on its own, over 7 s
+                # seen at a boot: not a failure, so isoPod asks again until it is done.
+                if not any(word in str(e) for word in BUSY) or asyncio.get_running_loop().time() >= patience:
+                    raise
         if not await self._stream(path, 0):
             raise ConnectionError("the link went away as soon as it was up")
 
